@@ -1,0 +1,82 @@
+
+name: Validate iOS Signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download VORN IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download mygame \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "VORN.ipa" \
+            --dir .
+
+      - name: Decode signing files
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$P12_BASE64" || { echo "Missing P12_BASE64"; exit 1; }
+          test -n "$P12_PASSWORD" || { echo "Missing P12_PASSWORD"; exit 1; }
+          test -n "$PROFILE_BASE64" || { echo "Missing MOBILEPROVISION_BASE64"; exit 1; }
+
+          printf '%s' "$P12_BASE64" | base64 -D > signing.p12
+          printf '%s' "$PROFILE_BASE64" | base64 -D > profile.mobileprovision
+          security cms -D -i profile.mobileprovision > profile.plist
+
+      - name: Inspect certificate and provisioning profile
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN="$RUNNER_TEMP/vorn.keychain-db"
+          security create-keychain -p "temporary-pass" "$KEYCHAIN"
+          security unlock-keychain -p "temporary-pass" "$KEYCHAIN"
+          security import signing.p12 \
+            -k "$KEYCHAIN" \
+            -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "temporary-pass" "$KEYCHAIN"
+
+          echo "=== Certificate fingerprint ==="
+          CERT_SHA=$(
+            security find-certificate -c "Apple" -p "$KEYCHAIN" 2>/dev/null |
+            openssl x509 -noout -fingerprint -sha1 2>/dev/null |
+            head -1 || true
+          )
+          echo "$CERT_SHA"
+
+          echo "=== Provisioning profile ==="
+          /usr/libexec/PlistBuddy -c "Print :Name" profile.plist || true
+          /usr/libexec/PlistBuddy -c "Print :UUID" profile.plist || true
+          /usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" profile.plist || true
+          /usr/libexec/PlistBuddy -c "Print :ExpirationDate" profile.plist || true
+          /usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" profile.plist || true
+
+          echo "=== IPA details ==="
+          mkdir ipa_contents
+          unzip -q VORN.ipa -d ipa_contents
+          APP=$(find ipa_contents/Payload -maxdepth 1 -name "*.app" -type d | head -1)
+          test -n "$APP" || { echo "No .app found in IPA"; exit 1; }
+
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist" || true
+
+          echo "=== Device registration ==="
+          /usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" profile.plist 2>/dev/null || echo "No device list (possibly Enterprise profile)"
+
+          echo "Validation inspection completed."
