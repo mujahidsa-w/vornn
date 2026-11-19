@@ -10,17 +10,22 @@ permissions:
 jobs:
   validate:
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Download VORN IPA
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
           gh release download mygame \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "$GITHUB_REPOSITORY" \
             --pattern "VORN.ipa" \
             --dir .
+
+          test -s VORN.ipa
+          echo "VORN IPA downloaded successfully."
 
       - name: Decode signing files
         env:
@@ -28,55 +33,121 @@ jobs:
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           PROFILE_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
         run: |
-          set -euo pipefail
-          test -n "$P12_BASE64" || { echo "Missing P12_BASE64"; exit 1; }
-          test -n "$P12_PASSWORD" || { echo "Missing P12_PASSWORD"; exit 1; }
-          test -n "$PROFILE_BASE64" || { echo "Missing MOBILEPROVISION_BASE64"; exit 1; }
+          set -eo pipefail
+
+          if [ -z "${P12_BASE64:-}" ]; then
+            echo "::error::Missing GitHub Secret: P12_BASE64"
+            exit 1
+          fi
+
+          if [ -z "${P12_PASSWORD:-}" ]; then
+            echo "::error::Missing GitHub Secret: P12_PASSWORD"
+            exit 1
+          fi
+
+          if [ -z "${PROFILE_BASE64:-}" ]; then
+            echo "::error::Missing GitHub Secret: MOBILEPROVISION_BASE64"
+            exit 1
+          fi
 
           printf '%s' "$P12_BASE64" | base64 -D > signing.p12
           printf '%s' "$PROFILE_BASE64" | base64 -D > profile.mobileprovision
-          security cms -D -i profile.mobileprovision > profile.plist
+
+          test -s signing.p12
+          test -s profile.mobileprovision
+
+          security cms -D \
+            -i profile.mobileprovision \
+            -o profile.plist
+
+          echo "Signing files decoded successfully."
 
       - name: Inspect certificate and provisioning profile
+        env:
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
         run: |
           set -euo pipefail
 
           KEYCHAIN="$RUNNER_TEMP/vorn.keychain-db"
-          security create-keychain -p "temporary-pass" "$KEYCHAIN"
-          security unlock-keychain -p "temporary-pass" "$KEYCHAIN"
+
+          security create-keychain \
+            -p "temporary-pass" "$KEYCHAIN"
+
+          security unlock-keychain \
+            -p "temporary-pass" "$KEYCHAIN"
+
           security import signing.p12 \
             -k "$KEYCHAIN" \
             -P "$P12_PASSWORD" \
             -T /usr/bin/codesign
+
           security set-key-partition-list \
             -S apple-tool:,apple: \
             -s -k "temporary-pass" "$KEYCHAIN"
 
-          echo "=== Certificate fingerprint ==="
-          CERT_SHA=$(
-            security find-certificate -c "Apple" -p "$KEYCHAIN" 2>/dev/null |
-            openssl x509 -noout -fingerprint -sha1 2>/dev/null |
-            head -1 || true
-          )
-          echo "$CERT_SHA"
+          echo "Certificate imported successfully."
 
-          echo "=== Provisioning profile ==="
-          /usr/libexec/PlistBuddy -c "Print :Name" profile.plist || true
-          /usr/libexec/PlistBuddy -c "Print :UUID" profile.plist || true
-          /usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" profile.plist || true
-          /usr/libexec/PlistBuddy -c "Print :ExpirationDate" profile.plist || true
-          /usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" profile.plist || true
+          echo "=== Certificate information ==="
 
-          echo "=== IPA details ==="
-          mkdir ipa_contents
-          unzip -q VORN.ipa -d ipa_contents
-          APP=$(find ipa_contents/Payload -maxdepth 1 -name "*.app" -type d | head -1)
-          test -n "$APP" || { echo "No .app found in IPA"; exit 1; }
+          security find-identity -v -p codesigning "$KEYCHAIN"
 
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist" || true
+          echo "=== Provisioning profile information ==="
+
+          /usr/libexec/PlistBuddy \
+            -c "Print :Name" profile.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Print :UUID" profile.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Print :TeamIdentifier:0" profile.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Print :ExpirationDate" profile.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Print :Entitlements:application-identifier" profile.plist || true
 
           echo "=== Device registration ==="
-          /usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" profile.plist 2>/dev/null || echo "No device list (possibly Enterprise profile)"
 
-          echo "Validation inspection completed."
+          /usr/libexec/PlistBuddy \
+            -c "Print :ProvisionedDevices" profile.plist 2>/dev/null \
+            || echo "No device list found."
+
+          echo "=== IPA inspection ==="
+
+          mkdir -p ipa_contents
+
+          unzip -q VORN.ipa -d ipa_contents
+
+          APP=$(find ipa_contents/Payload \
+            -maxdepth 1 \
+            -name "*.app" \
+            -type d | head -1)
+
+          if [ -z "$APP" ]; then
+            echo "::error::No application bundle found inside IPA."
+            exit 1
+          fi
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy \
+            -c "Print :CFBundleIdentifier" "$APP/Info.plist")
+
+          VERSION=$(/usr/libexec/PlistBuddy \
+            -c "Print :CFBundleVersion" "$APP/Info.plist" || true)
+
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "Build version: $VERSION"
+
+          echo "=== Signing status ==="
+
+          codesign -dv "$APP" 2>&1 || true
+
+          echo "Validation inspection completed successfully."
+
+      - name: Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f signing.p12 profile.mobileprovision profile.plist
+          security delete-keychain "$RUNNER_TEMP/vorn.keychain-db" 2>/dev/null || true
+          echo "Temporary signing files cleaned."
