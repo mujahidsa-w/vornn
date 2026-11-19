@@ -1,1 +1,151 @@
 
+name: VORN OTA Install Page
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        id: pages
+
+      - name: Find IPA in mygame Release
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: 'mygame'
+            });
+
+            const asset = release.data.assets.find(
+              a => a.name.toLowerCase().endsWith('.ipa')
+            );
+
+            if (!asset) {
+              core.setFailed('No IPA found in mygame release');
+              return;
+            }
+
+            core.setOutput('asset_url', asset.browser_download_url);
+            core.setOutput('asset_name', asset.name);
+
+      - name: Download IPA
+        env:
+          IPA_URL: ${{ steps.release.outputs.asset_url }}
+        run: |
+          mkdir -p dist
+          curl -L --fail --retry 3 \
+            "$IPA_URL" -o game.ipa
+
+      - name: Generate OTA Manifest and Page
+        env:
+          ASSET_URL: ${{ steps.release.outputs.asset_url }}
+          PAGE_URL: ${{ steps.pages.outputs.base_url }}
+          GAME_NAME: VORN
+        run: |
+          python3 - <<'PY'
+          import plistlib, zipfile, os, html
+          from urllib.parse import quote
+
+          ipa = "game.ipa"
+
+          with zipfile.ZipFile(ipa) as z:
+              info = next(
+                  n for n in z.namelist()
+                  if n.startswith("Payload/")
+                  and n.endswith(".app/Info.plist")
+              )
+              data = plistlib.loads(z.read(info))
+
+          bundle = data["CFBundleIdentifier"]
+          version = str(
+              data.get("CFBundleShortVersionString",
+                       data.get("CFBundleVersion", "1.0"))
+          )
+
+          manifest = {
+              "items": [{
+                  "assets": [{
+                      "kind": "software-package",
+                      "url": os.environ["ASSET_URL"]
+                  }],
+                  "metadata": {
+                      "bundle-identifier": bundle,
+                      "bundle-version": version,
+                      "kind": "software",
+                      "title": os.environ["GAME_NAME"]
+                  }
+              }]
+          }
+
+          with open("dist/manifest.plist", "wb") as f:
+              plistlib.dump(manifest, f, fmt=plistlib.FMT_XML)
+
+          base = os.environ["PAGE_URL"].rstrip("/")
+          manifest_url = base + "/manifest.plist"
+          install_url = (
+              "itms-services://?action=download-manifest&url="
+              + quote(manifest_url, safe=":/")
+          )
+
+          page = f"""<!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta charset="UTF-8">
+          <title>VORN | iOS</title>
+          <style>
+          body{{background:#10131b;color:white;font-family:Arial;
+          text-align:center;padding:70px 20px}}
+          .card{{max-width:400px;margin:auto;background:#1d2431;
+          padding:30px;border-radius:20px}}
+          a{{display:block;background:#2775ff;color:white;
+          padding:17px;border-radius:12px;text-decoration:none;
+          font-weight:bold;margin-top:25px}}
+          </style>
+          </head>
+          <body>
+          <div class="card">
+          <h1>VORN</h1>
+          <p>iOS Game Installation</p>
+          <p>Version: {html.escape(version)}</p>
+          <a href="{html.escape(install_url, quote=True)}">
+          INSTALL GAME
+          </a>
+          <p>Open this page in Safari.</p>
+          </div>
+          </body>
+          </html>"""
+
+          with open("dist/index.html", "w") as f:
+              f.write(page)
+          PY
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
